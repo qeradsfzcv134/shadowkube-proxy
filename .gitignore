@@ -1,0 +1,5 @@
+target/
+log/
+Session.vim
+shadowproxy
+log.json

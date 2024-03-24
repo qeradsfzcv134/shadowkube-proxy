@@ -1,0 +1,35 @@
+{
+  "services": [
+    10250,
+    8081,
+    2375,
+    2379,
+    30001
+  ],
+  "redirect": "192.168.60.126",
+  "secret": "toor",
+  "report": 13389,
+  "log": "log.json",
+  "rules": [
+    {
+      "client": "*",
+      "port": 10250
+    },
+    {
+      "client": "*",
+      "port": 2375
+    },
+    {
+      "client": "*",
+      "port": 8081
+    },
+    {
+      "client": "*",
+      "port": 80
+    },
+    {
+      "client": "*",
+      "port": 2379
+    }
+  ]
+}
