@@ -1,3 +1,4 @@
+extern crate flate2;
 use chrono::prelude::Local;
 use flate2::read::GzDecoder;
 use hyper::server::conn::AddrStream;
@@ -12,15 +13,16 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::str;
+use std::sync::Mutex;
 use tokio::select;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
-    services: Vec<Service>,
+    services: Vec<u16>,
+    redirect: String,
     secret: String,
     report: u16,
     log: String,
@@ -28,19 +30,6 @@ struct Config {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Service {
-    listen: u16,
-    production: RedirectTarget,
-    shadow: RedirectTarget,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct RedirectTarget {
-    ip: String,
-    port: u16,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Rule {
     client: String,
     port: u16,
@@ -60,6 +49,7 @@ struct Log {
     header: String,
     body: String,
     method: String,
+    status: u16,
     time: String,
     redirect: String,
 }
@@ -75,9 +65,7 @@ async fn main() {
     env_logger::init();
 
     info!("{}", "Starting proxy server...");
-    // get address from config
-
-    let report_addr = SocketAddr::from(([0, 0, 0, 0], CONFIG.lock().await.report));
+    let report_addr = SocketAddr::from(([0, 0, 0, 0], CONFIG.lock().unwrap().report));
     let client = Client::builder()
         .http1_title_case_headers(true)
         .http1_preserve_header_case(true)
@@ -97,9 +85,9 @@ async fn main() {
     let make_report = make_service_fn(|_| async { Ok::<_, Infallible>(service_fn(report)) });
 
     let mut services: Vec<JoinHandle<()>> = Vec::new();
-    for svc in &CONFIG.lock().await.services {
-        info!("Listening on port {}", svc.listen);
-        let addr = SocketAddr::from(([0, 0, 0, 0], svc.listen));
+    for port in &CONFIG.lock().unwrap().services {
+        info!("Listening on port {}", port);
+        let addr = SocketAddr::from(([0, 0, 0, 0], *port));
         let server = Server::bind(&addr).serve(make_service.clone());
         let handle = tokio::spawn(async move {
             if let Err(e) = server.await {
@@ -132,6 +120,7 @@ async fn handler(
     src_ip: String,
 ) -> Result<Response<Body>, hyper::Error> {
     info!("{} {} {} {}", src_ip, req.method(), port, req.uri());
+    let now = Local::now();
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let params = req.uri().query().unwrap_or("").to_string();
@@ -141,46 +130,38 @@ async fn handler(
         Ok(v) => v.to_string(),
         Err(_e) => String::from(""),
     };
-
-    let mut production_addr: Option<String> = None;
-    let mut shadow_addr: Option<String> = None;
-
-    let config = CONFIG.lock().await;
-    let services = &config.services;
-    let rules = &config.rules;
-    for service in services {
-        if service.listen == port {
-            production_addr = Some(format!(
-                "http://{}:{}{}",
-                service.production.ip, service.production.port, path
-            ));
-            shadow_addr = Some(format!("http://{}:{}{}", service.shadow.ip, service.shadow.port, path));
-        }
-    }
-
-    let if_redirect = match_rule(src_ip.clone(), port, rules).await;
-    let target_url = match if_redirect {
-        true => shadow_addr.expect("shadow address not found"),
-        false => production_addr.expect("production address not found"),
+    // let addr_ip = match if_shadow {
+    //     true => CONFIG.lock().unwrap().shadow.clone(),
+    //     false => CONFIG.lock().unwrap().product.clone(),
+    // };
+    let redirect_ip = CONFIG.lock().unwrap().redirect.clone();
+    let if_shadow = match_rule(src_ip.clone(), port);
+    let protocol = match port {
+        10250 => "https",
+        _ => "http",
     };
-
-    let log = Log {
-        src_ip: src_ip.clone(),
-        dst_port: port,
-        path: path.clone(),
-        params: params.clone(),
-        header: headers
-            .iter()
-            .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap()))
-            .collect::<Vec<String>>()
-            .join("\n"),
-        body: body_str.clone(),
-        method: method.clone(),
-        time: Local::now().to_string(),
-        redirect: if_redirect.to_string(),
+    let redirect_port = match if_shadow {
+        true => port - 1,
+        false => port + 1,
     };
-
-    logging(log, &config.log).await;
+    let target_url = match params.as_str() {
+        "" => format!("{}://{}:{}{}", protocol, redirect_ip, redirect_port, path),
+        _ => format!(
+            "{}://{}:{}{}?{}",
+            protocol, redirect_ip, redirect_port, path, params
+        ),
+    };
+    logging(
+        now.to_string(),
+        src_ip.clone(),
+        method.clone(),
+        port,
+        path,
+        params,
+        headers.clone(),
+        body_str,
+        if_shadow,
+    );
 
     let method = match method.as_str() {
         "GET" => hyper::Method::GET,
@@ -196,10 +177,11 @@ async fn handler(
         .body(Body::from(body))
         .unwrap();
 
+    println!("body: {:?}", request_builder.body());
     info!(
         "proxy to: {} {}",
         request_builder.method(),
-        request_builder.uri(),
+        request_builder.uri()
     );
 
     *request_builder.headers_mut() = headers;
@@ -216,7 +198,7 @@ async fn handler(
             // Create a new response with the decompressed body
             let mut resp = Response::new(Body::from(decompressed_body));
             *resp.status_mut() = hyper::StatusCode::OK;
-            let mut latest_client = LATEST_CLIENT.lock().await;
+            let mut latest_client = LATEST_CLIENT.lock().unwrap();
             // Record the latest client IP address
             *latest_client = src_ip.clone();
             return Ok(resp);
@@ -235,7 +217,7 @@ async fn handler(
 
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = hyper::StatusCode::OK;
-    let mut latest_client = LATEST_CLIENT.lock().await;
+    let mut latest_client = LATEST_CLIENT.lock().unwrap();
     // record the latest client IP address
     *latest_client = src_ip;
     Ok(resp)
@@ -249,12 +231,12 @@ async fn report(mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> 
     let whole_body = hyper::body::to_bytes(req.body_mut()).await?;
     let form: FormData = serde_urlencoded::from_bytes(&whole_body).unwrap();
 
-    if form.secret == CONFIG.lock().await.secret {
-        let mut latest_client = LATEST_CLIENT.lock().await;
+    if form.secret == CONFIG.lock().unwrap().secret {
+        let mut latest_client = LATEST_CLIENT.lock().unwrap();
         if latest_client.is_empty() {
             return Ok(Response::new(Body::from("OK")));
         }
-        let mut c = CONFIG.lock().await;
+        let mut c = CONFIG.lock().unwrap();
         let r = Rule {
             client: latest_client.to_string(),
             port: 0,
@@ -272,8 +254,12 @@ async fn report(mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> 
     Ok(Response::new(Body::from("OK")))
 }
 
-async fn match_rule(ip: String, port: u16, rules: &Vec<Rule>) -> bool {
-    for rule in rules {
+/// check if the client is malicious according to rules
+///
+/// * `conn`: connection from client
+fn match_rule(ip: String, port: u16) -> bool {
+    let c = CONFIG.lock().unwrap();
+    for rule in &c.rules {
         if rule.client == ip || rule.port == port {
             warn!("malicious: {} {}", ip, port);
             return true;
@@ -294,8 +280,39 @@ fn load_conf() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(parsed)
 }
 
-async fn logging(log: Log, log_file: &str) {
+/// logging request
+fn logging(
+    time: String,
+    src_ip: String,
+    method: String,
+    port: u16,
+    path: String,
+    params: String,
+    headers: hyper::HeaderMap,
+    body: String,
+    if_shadow: bool,
+) {
+    let headers = headers
+        .iter()
+        .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap()))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    let log = Log {
+        src_ip,
+        dst_port: port,
+        path,
+        params,
+        header: headers,
+        body,
+        method,
+        status: 200,
+        time,
+        redirect: if_shadow.to_string(),
+    };
+
     let json = serde_json::to_string(&log).unwrap();
+    let log_file = CONFIG.lock().unwrap().log.clone();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -309,7 +326,7 @@ async fn shutdown_signal() {
         .await
         .expect("failed to install CTRL+C signal handler");
     info!("shutting down");
-    let c = CONFIG.lock().await;
+    let c = CONFIG.lock().unwrap();
     let serialized = serde_json::to_string_pretty(&*c).unwrap();
     let mut file = File::create("config.json").unwrap();
     file.write_all(serialized.as_bytes()).unwrap();

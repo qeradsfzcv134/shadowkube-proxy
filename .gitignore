@@ -3,3 +3,4 @@ log/
 Session.vim
 shadowproxy
 log.json
+Makefile
